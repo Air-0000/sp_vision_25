@@ -348,4 +348,11 @@ DPS = 单位时间射击窗口占比 \times 射频 \times 单发子弹伤害
 
 
 ## Star History
-[![Star History Chart](https://api.star-history.com/svg?repos=TongjiSuperPower/sp_vision_25&type=Date)](https://www.star-history.com/#TongjiSuperPower/sp_vision_25&Date)
+
+<a href="https://www.star-history.com/?repos=TongjiSuperPower%2Fsp_vision_25&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=TongjiSuperPower/sp_vision_25&type=date&theme=dark&legend=top-left&sealed_token=jYfs34W1ly53O8lr8MPceajIt26W2HAh0-Zh764M7QUQEn6u_GG2rjShQENOmzt6Huodu-78OBXxE3jDxsxiJY05tC-bEAZdAvrUzgwczrKwyEbRs3cj8tmGhXw1HcY5h60P8LQ8dFuErb2kunpXE7KU4UGGAUrkdBwhUOl_Fv606LOIfCT_T66tnX0L" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=TongjiSuperPower/sp_vision_25&type=date&legend=top-left&sealed_token=jYfs34W1ly53O8lr8MPceajIt26W2HAh0-Zh764M7QUQEn6u_GG2rjShQENOmzt6Huodu-78OBXxE3jDxsxiJY05tC-bEAZdAvrUzgwczrKwyEbRs3cj8tmGhXw1HcY5h60P8LQ8dFuErb2kunpXE7KU4UGGAUrkdBwhUOl_Fv606LOIfCT_T66tnX0L" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=TongjiSuperPower/sp_vision_25&type=date&legend=top-left&sealed_token=jYfs34W1ly53O8lr8MPceajIt26W2HAh0-Zh764M7QUQEn6u_GG2rjShQENOmzt6Huodu-78OBXxE3jDxsxiJY05tC-bEAZdAvrUzgwczrKwyEbRs3cj8tmGhXw1HcY5h60P8LQ8dFuErb2kunpXE7KU4UGGAUrkdBwhUOl_Fv606LOIfCT_T66tnX0L" />
+ </picture>
+</a>
