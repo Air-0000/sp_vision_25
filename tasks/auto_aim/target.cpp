@@ -174,6 +174,11 @@ void Target::predict(double dt)
     v1 = 100;   // 加速度方差（位置维度）
     v2 = 400;   // 角加速度方差（角度维度，小陀螺可能高速旋转）
   }
+
+  // ---- 自适应 Q 调节 ----
+  // 根据 NIS 统计量动态调整 v1/v2，机动时更快跟踪，平稳时更平滑
+  adaptive_Q_scale(ekf_, v1, v2);
+
   auto a = dt * dt * dt * dt / 4;  // dt^4/4
   auto b = dt * dt * dt / 2;       // dt^3/2
   auto c = dt * dt;                // dt^2
@@ -208,6 +213,52 @@ void Target::predict(double dt)
     this->ekf_.x[7] = this->ekf_.x[7] > 0 ? 2.51 : -2.51;
 
   ekf_.predict(F, Q, f);
+}
+
+// ========== 步骤 3-2b：自适应 Q 调节 ==========
+
+/**
+ * @brief 根据 NIS 统计量自适应调节过程噪声 Q
+ * @details 原理：当 EKF 的 NIS（归一化创新平方）持续偏高时，说明预测与观测不一致，
+ *          需要增大 Q（信任观测更多）；当 NIS 持续偏低时说明过度平滑，可以减小 Q。
+ *
+ *          调节策略（基于滑动窗口 NIS 失败率）：
+ *          - recent_fail_rate > 40%：Q *= 2.0（增大过程噪声，更快跟踪机动）
+ *          - recent_fail_rate < 5%： Q *= 0.8（减小过程噪声，更平滑滤波）
+ *          - 其他范围：保持不变
+ *
+ *          使用指数移动平均避免 Q 突变：
+ *          scale = 0.7 * scale_old + 0.3 * scale_new
+ */
+static void adaptive_Q_scale(
+  tools::ExtendedKalmanFilter & ekf,
+  double & v1, double & v2)
+{
+  // 需要至少 50 次更新才有统计意义
+  if (ekf.recent_nis_failures.size() < 50) return;
+
+  int recent_failures = std::accumulate(
+    ekf.recent_nis_failures.end() - 50, ekf.recent_nis_failures.end(), 0);
+  double fail_rate = static_cast<double>(recent_failures) / 50.0;
+
+  static double scale = 1.0;
+  double target_scale = scale;
+
+  if (fail_rate > 0.4) {
+    // 发散趋势 → 增大 Q，信任观测
+    target_scale = std::min(scale * 2.0, 10.0);
+  } else if (fail_rate < 0.05) {
+    // 过度平滑 → 减小 Q
+    target_scale = std::max(scale * 0.8, 0.1);
+  }
+
+  // 指数移动平均，防止突变
+  scale = 0.7 * scale + 0.3 * target_scale;
+
+  if (std::abs(scale - 1.0) > 0.01) {
+    v1 *= scale;
+    v2 *= scale;
+  }
 }
 
 // ========== 步骤 3-3：EKF 更新（观测匹配 + 更新） ==========

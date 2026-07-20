@@ -198,15 +198,27 @@ if __name__ == '__main__':
         x_miss, y_miss, t_miss = solve_drag(V0, p_g)
 
         # Find y at target distance for the miss case
-        y_err = np.interp(d, x_miss, y_miss)
+        # If the projectile didn't reach d, extrapolate the y trend from last 10 points
+        if d > x_miss[-1]:
+            # Use last 10 points to estimate trajectory slope near end
+            n = min(10, len(x_miss) - 1)
+            if n >= 2:
+                dx = x_miss[-1] - x_miss[-1-n]
+                dy = y_miss[-1] - y_miss[-1-n]
+                slope = dy / dx if abs(dx) > 1e-6 else 0
+                y_err = y_miss[-1] + slope * (d - x_miss[-1])
+            else:
+                y_err = y_miss[-1]
+        else:
+            y_err = np.interp(d, x_miss, y_miss)
 
         print(f"\n  [{label}] d={d}m:")
         print(f"    Gravity pitch: {p_g*180/np.pi:.4f}°")
         print(f"    Drag pitch:    {p_d*180/np.pi:.4f}°")
         print(f"    Difference:    {(p_g-p_d)*180/np.pi:.4f}°")
         print(f"    If using gravity model with drag present:")
-        print(f"      Impact y at {d}m: {y_err*100:.1f}cm below target")
-        print(f"      Error angle:     {np.arctan(abs(y_err)/d)*180/np.pi:.4f}°")
+        print(f"      Actual hit distance: {x_miss[-1]:.3f}m (target at {d}m)")
+        print(f"      Miss y at {d}m:      {abs(y_err)*100:.1f}cm below target")
 
         return xg, yg, xd, yd, x_miss, y_miss
 
@@ -257,8 +269,15 @@ if __name__ == '__main__':
         p_g, _, ok = required_pitch_gravity(d, h)
         if ok:
             xm, ym, _ = solve_drag(V0, p_g)
-            y_err = np.interp(d, xm, ym) if d <= xm[-1] else -100
-            errors.append(abs(y_err) * 100)  # cm
+            if d > xm[-1]:
+                n = min(10, len(xm) - 1)
+                dx = xm[-1] - xm[-1-n]
+                dy = ym[-1] - ym[-1-n]
+                slope = dy / dx if abs(dx) > 1e-6 else 0
+                y_err = abs(ym[-1] + slope * (d - xm[-1]))
+            else:
+                y_err = abs(np.interp(d, xm, ym))
+            errors.append(y_err * 100)  # cm
         else:
             errors.append(0)
 
