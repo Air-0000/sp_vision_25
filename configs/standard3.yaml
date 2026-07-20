@@ -84,6 +84,11 @@ yaw_kd: 0
 pitch_kp: 0
 pitch_kd: 0
 
+#####-----TensorRT参数（可选）-----#####
+# yolo_name: "yolov5_trt" 时启用
+# 先用: trtexec --onnx=assets/best2-sim.onnx --saveEngine=assets/best2-sim.engine --fp16
+yolo_trt_engine_path: "assets/best2-sim.engine"
+
 #####-----planner-----#####
 fire_thresh: 0.0035
 

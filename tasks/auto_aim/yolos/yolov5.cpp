@@ -1,3 +1,22 @@
+/**
+ * @file yolov5.cpp
+ * @brief YOLOv5 OpenVINO 推理实现
+ * @details 完整的 YOLOv5 检测管线实现：
+ *          1. 预处理：ROI 裁剪（可选）→ letterbox resize 到 640×640 → NHWC uint8 张量
+ *          2. 推理：OpenVINO 同步推理
+ *          3. 后处理：sigmoid → 阈值过滤 → NMS → 颜色/编号 argmax → 名称/类型校验
+ *             → 传统方法角点二次修正（可选）
+ *
+ *          OpenVINO 预处理配置：
+ *          - 输入布局：NHWC（OpenVINO 输入格式要求）
+ *          - 数据类型：uint8（减少 H2D 传输带宽）
+ *          - 颜色格式：BGR（OpenVINO 内部转为 RGB 并归一化处理）
+ *          - 后处理：OpenVINO 自动完成归一化（÷255.0）
+ *
+ * @note 预处理的 letterbox 操作保持宽高比，不足部分补 0（黑色边）。
+ *       模型的输出有 8400 个候选框（3 个检测头的 Anchor 点总数）。
+ */
+
 #include "yolov5.hpp"
 
 #include <fmt/chrono.h>
@@ -10,11 +29,24 @@
 
 namespace auto_aim
 {
+
+// ========== 步骤 1-1：YOLOv5 检测器初始化 ==========
+
 YOLOV5::YOLOV5(const std::string & config_path, bool debug)
 : debug_(debug), detector_(config_path, false)
 {
   auto yaml = YAML::LoadFile(config_path);
 
+  /**
+   * 读取配置：
+   * - model_path：YOLOv5 的 OpenVINO IR 模型文件路径（.xml）
+   * - device：推理设备（CPU / GPU / AUTO）
+   * - threshold：传统方法二值化阈值（用于角点二次修正）
+   * - min_confidence：分类器最低置信度
+   * - roi：感兴趣区域（只检测该区域内的目标，减少计算量）
+   * - use_roi：是否启用 ROI
+   * - use_traditional：是否用传统方法二次修正角点
+   */
   model_path_ = yaml["yolov5_model_path"].as<std::string>();
   device_ = yaml["device"].as<std::string>();
   binary_threshold_ = yaml["threshold"].as<double>();
@@ -31,7 +63,19 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
 
   save_path_ = "imgs";
   std::filesystem::create_directory(save_path_);
+
+  // ---------- OpenVINO 模型加载 ----------
   auto model = core_.read_model(model_path_);
+
+  /**
+   * 配置预处理流程：
+   * 1. 输入张量格式：NHWC uint8，尺寸 1×640×640×3，BGR 颜色顺序
+   * 2. 模型内部格式：NCHW float32
+   * 3. 预处理流水线：uint8 → float32 → BGR→RGB → ÷255.0 归一化
+   *
+   * 这样 CPU→GPU 传输的是 uint8（带宽仅为 float32 的 1/4），
+   * 归一化由 OpenVINO 在 GPU 上完成，节省了 CPU 预处理时间。
+   */
   ov::preprocess::PrePostProcessor ppp(model);
   auto & input = ppp.input();
 
@@ -48,25 +92,30 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     .convert_color(ov::preprocess::ColorFormat::RGB)
     .scale(255.0);
 
-  // TODO: ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY)
   model = ppp.build();
+
+  // 编译模型到指定设备，使用 LATENCY 模式（最小化单帧推理延迟）
   compiled_model_ = core_.compile_model(
     model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
 }
 
+// ========== 步骤 1-2：完整检测管线 ==========
+
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
 {
+  // ---------- 输入检查 ----------
   if (raw_img.empty()) {
     tools::logger()->warn("Empty img!, camera drop!");
     return std::list<Armor>();
   }
 
+  // ---------- 步骤 1-2a：ROI 裁剪（可选） ----------
   cv::Mat bgr_img;
   if (use_roi_) {
-    if (roi_.width == -1) {  // -1 表示该维度不裁切
+    if (roi_.width == -1) {  // -1 表示不裁切宽度
       roi_.width = raw_img.cols;
     }
-    if (roi_.height == -1) {  // -1 表示该维度不裁切
+    if (roi_.height == -1) {  // -1 表示不裁切高度
       roi_.height = raw_img.rows;
     }
     bgr_img = raw_img(roi_);
@@ -74,39 +123,79 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     bgr_img = raw_img;
   }
 
+  // ---------- 步骤 1-2b：Letterbox 预处理 ----------
+  // 保持宽高比缩放到 640×640，不足部分补 0（黑色边框）
+  // 这种处理方式比直接 resize 到 640×640 更好，因为不会改变目标的宽高比，
+  // 模型看到的目标形状与训练时一致，检测精度更高。
   auto x_scale = static_cast<double>(640) / bgr_img.rows;
   auto y_scale = static_cast<double>(640) / bgr_img.cols;
-  auto scale = std::min(x_scale, y_scale);
+  auto scale = std::min(x_scale, y_scale);  // 取较小缩放比保证完整包含原图
   auto h = static_cast<int>(bgr_img.rows * scale);
   auto w = static_cast<int>(bgr_img.cols * scale);
 
-  // preproces
-  auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+  auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));  // 黑色画布
   auto roi = cv::Rect(0, 0, w, h);
-  cv::resize(bgr_img, input(roi), {w, h});
+  cv::resize(bgr_img, input(roi), {w, h});  // 将缩放后的图像放到左上角
+
+  // ---------- 步骤 1-2c：OpenVINO 推理 ----------
+  // 创建 NHWC uint8 张量，指向 input 图像数据（零拷贝）
   ov::Tensor input_tensor(ov::element::u8, {1, 640, 640, 3}, input.data);
 
-  // infer
   auto infer_request = compiled_model_.create_infer_request();
   infer_request.set_input_tensor(input_tensor);
-  infer_request.infer();
+  infer_request.infer();  // 同步推理（阻塞直到返回结果）
 
-  // postprocess
+  // ---------- 步骤 1-2d：获取输出 ----------
+  // 输出形状：[1, 22, 8400] → 转为 [8400, 22] 的 CV_32F 矩阵
   auto output_tensor = infer_request.get_output_tensor();
   auto output_shape = output_tensor.get_shape();
   cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());
 
+  // ---------- 步骤 1-2e：后处理（解析 + NMS + 校验） ----------
   return parse(scale, output, raw_img, frame_count);
 }
+
+// ---------- 对外暴露的 postprocess 接口（供多线程管线使用） ----------
+
+std::list<Armor> YOLOV5::postprocess(
+  double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count)
+{
+  return parse(scale, output, bgr_img, frame_count);
+}
+
+// ========== 步骤 1-3：输出解析（核心后处理逻辑） ==========
 
 std::list<Armor> YOLOV5::parse(
   double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count)
 {
-  // for each row: xywh + classess
+  /**
+   * 解析 8400 个候选框，每个框有 22 个 float 值：
+   *
+   * 布局说明（以行为单位）：
+   *   row[0..7] ：4 个角点的 x, y 像素坐标（模型输出的原始 raw 值，非归一化）
+   *     [0,1] = 第 1 个角点（通常是最左上角）
+   *     [2,3] = 第 2 个角点
+   *     [4,5] = 第 3 个角点
+   *     [6,7] = 第 4 个角点
+   *   row[8]    ：objectness（目标置信度），pre-sigmoid raw 值
+   *   row[9..12]：4 个颜色的 logits（顺序：red, blue, extinguish, purple）
+   *   row[13..21]：9 个编号的 logits（顺序对应 ArmorName 枚举）
+   *
+   * 后处理流程：
+   * 1. sigmoid(objectness) → 阈值过滤
+   * 2. argmax 取颜色和编号
+   * 3. 角点 → 最小外接矩形（用于 NMS）
+   * 4. NMS 去除重叠框
+   * 5. 名称/类型校验
+   * 6. 传统方法二次修正角点（可选）
+   */
+
   std::vector<int> color_ids, num_ids;
   std::vector<float> confidences;
   std::vector<cv::Rect> boxes;
   std::vector<std::vector<cv::Point2f>> armors_key_points;
+
+  // 遍历 8400 个候选框（8400 = 80×80 + 40×40 + 20×20 三个检测头）
   for (int r = 0; r < output.rows; r++) {
     double score = output.at<float>(r, 8);
     score = sigmoid(score);
@@ -115,9 +204,9 @@ std::list<Armor> YOLOV5::parse(
 
     std::vector<cv::Point2f> armor_key_points;
 
-    //颜色和类别独热向量
-    cv::Mat color_scores = output.row(r).colRange(9, 13);     //color
-    cv::Mat classes_scores = output.row(r).colRange(13, 22);  //num
+    // 颜色和类别独热向量
+    cv::Mat color_scores = output.row(r).colRange(9, 13);     // 4 个颜色
+    cv::Mat classes_scores = output.row(r).colRange(13, 22);  // 9 个编号
     cv::Point class_id, color_id;
     int _class_id, _color_id;
     double score_color, score_num;
@@ -126,6 +215,7 @@ std::list<Armor> YOLOV5::parse(
     _class_id = class_id.x;
     _color_id = color_id.x;
 
+    // 解析四个角点，坐标除以 scale 还原到原图尺寸
     armor_key_points.push_back(
       cv::Point2f(output.at<float>(r, 0) / scale, output.at<float>(r, 1) / scale));
     armor_key_points.push_back(
@@ -135,6 +225,7 @@ std::list<Armor> YOLOV5::parse(
     armor_key_points.push_back(
       cv::Point2f(output.at<float>(r, 2) / scale, output.at<float>(r, 3) / scale));
 
+    // 从四个角点计算最小外接矩形（用于 NMS）
     float min_x = armor_key_points[0].x;
     float max_x = armor_key_points[0].x;
     float min_y = armor_key_points[0].y;
@@ -156,12 +247,16 @@ std::list<Armor> YOLOV5::parse(
     armors_key_points.emplace_back(armor_key_points);
   }
 
+  // ---------- NMS（非极大值抑制） ----------
+  // 移除重叠度（IoU）超过阈值的重复检测框，保留置信度最高的
   std::vector<int> indices;
   cv::dnn::NMSBoxes(boxes, confidences, score_threshold_, nms_threshold_, indices);
 
+  // 构造 Armor 对象
   std::list<Armor> armors;
   for (const auto & i : indices) {
     if (use_roi_) {
+      // 如果使用 ROI，需要将 ROI 内的坐标加上 offset（ROI 左上角在原图中的位置）
       armors.emplace_back(
         color_ids[i], num_ids[i], confidences[i], boxes[i], armors_key_points[i], offset_);
     } else {
@@ -169,18 +264,22 @@ std::list<Armor> YOLOV5::parse(
     }
   }
 
+  // ---------- 后处理过滤 ----------
   tmp_img_ = bgr_img;
   for (auto it = armors.begin(); it != armors.end();) {
+    // 名称和置信度检查
     if (!check_name(*it)) {
       it = armors.erase(it);
       continue;
     }
 
+    // 类型匹配检查
     if (!check_type(*it)) {
       it = armors.erase(it);
       continue;
     }
-    // 使用传统方法二次矫正角点
+
+    // 使用传统方法二次修正角点（YOLO 输出的角点可能不够精确）
     if (use_traditional_) detector_.detect(*it, bgr_img);
 
     it->center_norm = get_center_norm(bgr_img, it->center);
@@ -192,27 +291,26 @@ std::list<Armor> YOLOV5::parse(
   return armors;
 }
 
+// ========== 步骤 1-4：后处理校验函数 ==========
+
 bool YOLOV5::check_name(const Armor & armor) const
 {
   auto name_ok = armor.name != ArmorName::not_armor;
   auto confidence_ok = armor.confidence > min_confidence_;
-
-  // 保存不确定的图案，用于神经网络的迭代
-  // if (name_ok && !confidence_ok) save(armor);
-
   return name_ok && confidence_ok;
 }
 
 bool YOLOV5::check_type(const Armor & armor) const
 {
+  /**
+   * 类型-名称匹配规则（同传统 Detector）：
+   * 小装甲板 → 不能是 one 和 base
+   * 大装甲板 → 不能是 two, sentry, outpost
+   */
   auto name_ok = (armor.type == ArmorType::small)
                    ? (armor.name != ArmorName::one && armor.name != ArmorName::base)
                    : (armor.name != ArmorName::two && armor.name != ArmorName::sentry &&
                       armor.name != ArmorName::outpost);
-
-  // 保存异常的图案，用于神经网络的迭代
-  // if (!name_ok) save(armor);
-
   return name_ok;
 }
 
@@ -222,6 +320,8 @@ cv::Point2f YOLOV5::get_center_norm(const cv::Mat & bgr_img, const cv::Point2f &
   auto w = bgr_img.cols;
   return {center.x / w, center.y / h};
 }
+
+// ========== 步骤 1-5：调试绘制 ==========
 
 void YOLOV5::draw_detections(
   const cv::Mat & img, const std::list<Armor> & armors, int frame_count) const
@@ -240,7 +340,7 @@ void YOLOV5::draw_detections(
     cv::Scalar green(0, 255, 0);
     cv::rectangle(detection, roi_, green, 2);
   }
-  cv::resize(detection, detection, {}, 0.5, 0.5);  // 显示时缩小图片尺寸
+  cv::resize(detection, detection, {}, 0.5, 0.5);
   cv::imshow("detection", detection);
 }
 
@@ -253,16 +353,16 @@ void YOLOV5::save(const Armor & armor) const
 
 double YOLOV5::sigmoid(double x)
 {
+  /**
+   * 数值稳定的 sigmoid 实现：
+   * - x > 0：1 / (1 + exp(-x))
+   * - x ≤ 0：exp(x) / (1 + exp(x))
+   * 避免了当 x 为很大的负数时 exp(-x) 溢出。
+   */
   if (x > 0)
     return 1.0 / (1.0 + exp(-x));
   else
     return exp(x) / (1.0 + exp(x));
-}
-
-std::list<Armor> YOLOV5::postprocess(
-  double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count)
-{
-  return parse(scale, output, bgr_img, frame_count);
 }
 
 }  // namespace auto_aim
